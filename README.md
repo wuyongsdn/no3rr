@@ -1,4 +1,4 @@
-# no3rr
+
 NO3RR Dataset Processing and Adsorbate Modeling
 This repository (no3rr) contains a collection of scripts and configuration files for processing chemical datasets and modeling adsorbate molecules. The code is designed to handle tasks such as data preprocessing, free energy extraction, adsorbate creation, and structure optimization.
 Table of Contents
