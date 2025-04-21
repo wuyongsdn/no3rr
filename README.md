@@ -61,5 +61,7 @@ Crystal data module configuration containing:
 ## 🙏 Acknowledgments
 
 All contributors for their valuable input
+
 Open-source library maintainers
+
 Research institutions supporting materials informatics
