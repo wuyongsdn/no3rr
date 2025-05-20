@@ -5,22 +5,48 @@ from ase.build import molecule
 from ase.optimize import LBFGS, BFGS, BFGSLineSearch, LBFGSLineSearch, GPMin, MDMin, FIRE
 from ase.visualize.plot import plot_atoms
 from ase.constraints import FixAtoms
+import logging
 
 from fairchem.core.common.relaxation.ase_utils import OCPCalculator
 import matplotlib.pyplot as plt
 import os
 from tqdm import tqdm
-import sys  # Added for command-line arguments
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import torch
 
-# Suppress warnings
 import warnings
 warnings.filterwarnings("ignore")
 
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    filename='adsorbate_placement.log'
+)
 
-def create_nh3o(n_position, bond_length_n_h=1.01, bond_length_n_o=1.40, angle_hno=107, angle_hnh=107):
-    """Create NH3O adsorbate molecule."""
-    adsorbate = Atoms('NH3O')
-    adsorbate.positions[0] = n_position
+# Define molecule creation functions
+def create_h2o(o_position, bond_length_o_h=0.957, angle_hoh=104.5):
+    """Create a water molecule at the specified oxygen position."""
+    adsorbate = Atoms('H2O')
+    adsorbate.positions[0] = o_position  # Oxygen atom position
+    # Hydrogen 1
+    adsorbate.positions[1] = o_position + np.array([
+        bond_length_o_h * np.cos(np.radians(angle_hoh / 2)),
+        bond_length_o_h * np.sin(np.radians(angle_hoh / 2)),
+        0
+    ])
+    # Hydrogen 2
+    adsorbate.positions[2] = o_position + np.array([
+        bond_length_o_h * np.cos(np.radians(-angle_hoh / 2)),
+        bond_length_o_h * np.sin(np.radians(-angle_hoh / 2)),
+        0
+    ])
+    return adsorbate
+
+def create_nh3(n_position, bond_length_n_h=1.01, angle_hnh=107):
+    """Create an ammonia molecule at the specified nitrogen position."""
+    adsorbate = Atoms('NH3')
+    adsorbate.positions[0] = n_position  # Nitrogen atom position
     # Hydrogen 1
     adsorbate.positions[1] = n_position + np.array([
         bond_length_n_h * np.cos(np.radians(angle_hnh - 90)),
@@ -39,119 +65,144 @@ def create_nh3o(n_position, bond_length_n_h=1.01, bond_length_n_o=1.40, angle_hn
         bond_length_n_h * np.sin(np.radians(angle_hnh - 90 + 240)),
         0
     ])
-    # Oxygen
-    adsorbate.positions[4] = n_position + np.array([
-        bond_length_n_o * np.cos(np.radians(angle_hno)),
-        bond_length_n_o * np.sin(np.radians(angle_hno)),
-        0
-    ])
     return adsorbate
 
+def create_h(position):
+    """Create a hydrogen atom at the specified position."""
+    adsorbate = Atoms('H')
+    adsorbate.positions[0] = position
+    return adsorbate
 
-def create_nh2(n_position, bond_length_n_h=1.01, angle_hnh=104.5):
-    """Create NH2 adsorbate molecule."""
-    adsorbate = Atoms('NH2')
-    adsorbate.positions[0] = n_position
-    # Hydrogen 1
+def create_no3(n_position, bond_length_n_o=1.22, angle_ono=120):
+    """Create a nitrate ion at the specified nitrogen position."""
+    adsorbate = Atoms('NO3')
+    adsorbate.positions[0] = n_position  # Nitrogen atom position
+    # Oxygen 1
     adsorbate.positions[1] = n_position + np.array([
-        bond_length_n_h * np.cos(np.radians(angle_hnh / 2)),
-        bond_length_n_h * np.sin(np.radians(angle_hnh / 2)),
+        bond_length_n_o,
+        0,
         0
     ])
-    # Hydrogen 2
+    # Oxygen 2
     adsorbate.positions[2] = n_position + np.array([
-        bond_length_n_h * np.cos(np.radians(-angle_hnh / 2)),
-        bond_length_n_h * np.sin(np.radians(-angle_hnh / 2)),
+        bond_length_n_o * np.cos(np.radians(120)),
+        bond_length_n_o * np.sin(np.radians(120)),
+        0
+    ])
+    # Oxygen 3
+    adsorbate.positions[3] = n_position + np.array([
+        bond_length_n_o * np.cos(np.radians(240)),
+        bond_length_n_o * np.sin(np.radians(240)),
         0
     ])
     return adsorbate
 
-
-# Set up OCPCalculator
-calc = OCPCalculator(
-    trainer="energy",
-    model_name="EquiformerV2-153M-S2EF-OC20-All+MD",
-    local_cache="",# model path
-    cpu=False,
-)
-
-# Dictionary of adsorbate creation functions
+# Create adsorbate function mapping
 adsorbate_functions = {
-    'nh3o': lambda n_position: create_nh3o(n_position),
-    'nh2': lambda n_position: create_nh2(n_position),
-    # ... (all other entries as before) ...
-    'nho2': lambda n_position: create_nho2(n_position)
+    'nh3': create_nh3,
+    'no3': create_no3,
+    'h': create_h,
+    'h2o': create_h2o
 }
 
-# Dictionary of input/output directories: key=adsorbate name, value=(input_dir, output_dir)
+# Input and output path dictionary, keys are system names (customizable), 
+# values are (input folder path, output folder path)
+input_dir = r'/home/sdengning/method/fairchem/predict/first/cal'
 input_output_dirs = {
-    'nh3': (input_dir, output_dir),
-    'nh3o': (input_dir, output_dir),
-    # ... (all other entries as before) ...
-    'nho2': (input_dir, output_dir)
+    'nh3': (input_dir, r'/home/sdengning/method/fairchem/predict/first/nh3'),
+    'no3': (input_dir, r'/home/sdengning/method/fairchem/predict/first/no3'),
+    'h': (input_dir, r'/home/sdengning/method/fairchem/predict/first/h'),
+    'h2o': (input_dir, r'/home/sdengning/method/fairchem/predict/first/h2o'),
 }
 
-def main():
-    # Get adsorbate to process from command-line argument (e.g., 'no3'), or process all if none specified
-    target_adsorbate = sys.argv[1].lower() if len(sys.argv) > 1 else None
-    
-    for adsorbate_name, (input_dir, output_dir) in input_output_dirs.items():
-        # Skip if target adsorbate is specified and doesn't match current name
-        if target_adsorbate is not None and adsorbate_name != target_adsorbate:
-            continue
-        
-        # Create output directory if it doesn't exist
-        os.makedirs(output_dir, exist_ok=True)
-        
-        # Get all CIF files in input directory
-        cif_files = [f for f in os.listdir(input_dir) if f.endswith('.cif')]
-        
-        for cif_file in tqdm(cif_files, desc=f"Processing {adsorbate_name} CIF files"):
-            slab = read(os.path.join(input_dir, cif_file))  # Read slab structure from CIF
-            
-            # Get lattice parameters (assuming 3D cell, focusing on z-direction for height)
-            lattice_param_z = slab.get_cell()[2, 2]
-            surface_positions = slab.get_positions()
-            surface_z_max = surface_positions[:, 2].max()
-            surface_z_min = surface_positions[:, 2].min()
-            half_z_height = (surface_z_max + surface_z_min) / 2
-            
-            # Fix atoms below half_z_height
-            fixed_indices = [i for i, pos in enumerate(surface_positions) if pos[2] < half_z_height]
-            slab.set_constraint(FixAtoms(indices=fixed_indices))
-            
-            # Define adsorption height above surface (5% of lattice z parameter)
-            height_above_surface = 0.05 * lattice_param_z
-            n_grid_points = 100
-            surface_x_min = surface_positions[:, 0].min()
-            surface_x_max = surface_positions[:, 0].max()
-            surface_y_min = surface_positions[:, 1].min()
-            surface_y_max = surface_positions[:, 1].max()
-            
-            # Generate grid positions for adsorption
-            grid_x, grid_y = np.meshgrid(
-                np.linspace(surface_x_min, surface_x_max, int(np.sqrt(n_grid_points))),
-                np.linspace(surface_y_min, surface_y_max, int(np.sqrt(n_grid_points)))
-            )
-            grid_positions = np.column_stack([grid_x.flatten(), grid_y.flatten()])
-            
-            for idx, (x, y) in enumerate(grid_positions):
-                slab_with_adsorbate = slab.copy()
-                n_position = np.array([x, y, surface_z_max + height_above_surface])
-                
-                # Create adsorbate molecule
-                adsorbate = adsorbate_functions[adsorbate_name](n_position)
-                slab_with_adsorbate += adsorbate
-                slab_with_adsorbate.calc = calc
-                
-                # Structure optimization
-                optimizer = LBFGS(slab_with_adsorbate, logfile=None)
-                optimizer.run(fmax=0.05, steps=100)
-                
-                # Get final energy and save structure
-                final_energy = slab_with_adsorbate.get_potential_energy()
-                output_filename = f"{output_dir}/{os.path.splitext(cif_file)[0]}_{idx}_E_{final_energy:.6f}.cif"
-                write(output_filename, slab_with_adsorbate)
+# Setup OCPCalculator
+calc = OCPCalculator(
+        model_name="DimeNet++-IS2RE-OC20-All",
+        local_cache="/home/sdengning/method/fairchem/predict/first",
+        cpu=False
+    )
 
-if __name__ == "__main__":
-    main()
+# Process each adsorbate's corresponding folder
+for adsorbate_name, (input_dir, output_dir) in input_output_dirs.items():
+    try:
+        # Check if the output folder exists, create it if not
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+            logging.info(f"Created directory: {output_dir}")
+            
+        # Get all CIF files
+        cif_files = [f for f in os.listdir(input_dir) if f.endswith('.cif')]
+        logging.info(f"Found {len(cif_files)} CIF files in {input_dir}")
+
+        # Process each CIF file
+        for cif_file in tqdm(cif_files, desc=f"Processing {adsorbate_name} CIF files"):
+            try:
+                slab = read(os.path.join(input_dir, cif_file))  # Read structure from CIF file
+                logging.info(f"Successfully read file: {cif_file}")
+
+                # Get lattice parameters
+                lattice_param_x = slab.get_cell()[0, 0]
+                lattice_param_y = slab.get_cell()[1, 1]
+                lattice_param_z = slab.get_cell()[2, 2]  # Get z-direction lattice parameter
+
+                # Calculate half of the lattice height
+                surface_x_max = slab.get_positions()[:, 0].max()
+                surface_x_min = slab.get_positions()[:, 0].min()
+                surface_y_max = slab.get_positions()[:, 1].max()
+                surface_y_min = slab.get_positions()[:, 1].min()
+                half_z_height = (slab.get_positions()[:, 2].max() + slab.get_positions()[:, 2].min()) / 2
+
+                # Find atoms below half_z_height and fix them
+                fixed_indices = [i for i, pos in enumerate(slab.get_positions()) if pos[2] < half_z_height]
+                constraint = FixAtoms(indices=fixed_indices)
+                slab.set_constraint(constraint)
+
+                # Set the height of the adsorbate above the surface
+                height_above_atoms = 0.05 * lattice_param_z  # Set height as a fraction of lattice parameter z
+
+                # Generate grid positions on the surface
+                num_points = 100
+                grid_x, grid_y = np.meshgrid(
+                    np.linspace(surface_x_min, surface_x_max, int(np.sqrt(num_points))),
+                    np.linspace(surface_y_min, surface_y_max, int(np.sqrt(num_points)))
+                )
+                grid_positions = np.column_stack([grid_x.flatten(), grid_y.flatten()])
+
+                # Loop over each grid position to place the adsorbate molecule
+                for i, (x, y) in enumerate(grid_positions):
+                    try:
+                        # Copy the slab
+                        slab_with_adsorbate_up = slab.copy()
+
+                        # Determine the position above the surface where the adsorbate will be placed
+                        anchor_position = np.array([x, y, slab.get_positions()[:, 2].max() + height_above_atoms])
+
+                        # Create the adsorbate at the specified position
+                        adsorbate = adsorbate_functions[adsorbate_name](anchor_position)
+
+                        # Add the adsorbate to the slab
+                        slab_with_adsorbate_up += adsorbate
+                        slab_with_adsorbate_up.calc = calc
+                        
+                        # Calculate potential energy
+                        final_energy_up = slab_with_adsorbate_up.get_potential_energy()
+
+                        # Save the structure without optimization
+                        up_file_path = rf'{output_dir}/{os.path.splitext(cif_file)[0]}_{i}_E_{final_energy_up:.6f}.cif'
+                        write(up_file_path, slab_with_adsorbate_up)
+                        
+                        logging.info(f"Successfully saved structure: {up_file_path}")
+                        
+                    except Exception as e:
+                        logging.error(f"Error processing grid position {i}: {str(e)}")
+                        continue
+                        
+            except Exception as e:
+                logging.error(f"Error processing CIF file {cif_file}: {str(e)}")
+                continue
+                
+    except Exception as e:
+        logging.error(f"Error processing adsorbate {adsorbate_name}: {str(e)}")
+        continue
+
+logging.info("All adsorbate placement calculations completed")    
